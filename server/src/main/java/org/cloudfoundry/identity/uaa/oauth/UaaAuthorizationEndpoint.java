@@ -13,12 +13,16 @@
 
 package org.cloudfoundry.identity.uaa.oauth;
 
+import org.cloudfoundry.identity.uaa.authentication.UaaAuthentication;
+import org.cloudfoundry.identity.uaa.oauth.client.ClientConstants;
 import org.cloudfoundry.identity.uaa.oauth.token.CompositeAccessToken;
+import org.cloudfoundry.identity.uaa.util.UaaHttpRequestUtils;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.InsufficientAuthenticationException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.common.OAuth2AccessToken;
 import org.springframework.security.oauth2.common.exceptions.BadClientCredentialsException;
 import org.springframework.security.oauth2.common.exceptions.ClientAuthenticationException;
@@ -59,6 +63,7 @@ import org.springframework.web.bind.annotation.SessionAttributes;
 import org.springframework.web.bind.support.DefaultSessionAttributeStore;
 import org.springframework.web.bind.support.SessionAttributeStore;
 import org.springframework.web.bind.support.SessionStatus;
+import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletWebRequest;
 import org.springframework.web.servlet.ModelAndView;
 import org.springframework.web.servlet.View;
@@ -66,6 +71,7 @@ import org.springframework.web.servlet.view.RedirectView;
 import org.springframework.web.util.UriComponentsBuilder;
 import org.springframework.web.util.UriUtils;
 
+import javax.servlet.http.HttpServletRequest;
 import java.io.UnsupportedEncodingException;
 import java.security.Principal;
 import java.util.Arrays;
@@ -75,6 +81,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import static org.cloudfoundry.identity.uaa.oauth.client.ClientConstants.ALLOWED_PROVIDERS;
 
 /**
  * Authorization endpoint that returns id_token's if requested.
@@ -124,7 +132,17 @@ public class UaaAuthorizationEndpoint extends AbstractEndpoint {
     private static final List<String> supported_response_types = Arrays.asList("code", "token", "id_token");
     @RequestMapping(value = "/oauth/authorize")
     public ModelAndView authorize(Map<String, Object> model, @RequestParam Map<String, String> parameters,
-                                  SessionStatus sessionStatus, Principal principal) {
+                                  SessionStatus sessionStatus, Principal principal, HttpServletRequest request) {
+
+        ClientDetails client;
+        String clientId;
+        try {
+            clientId = parameters.get("client_id");
+            client = getClientDetailsService().loadClientByClientId(clientId);
+        }
+        catch (NoSuchClientException x) {
+            throw new InvalidClientException(x.getMessage());
+        }
 
         // Pull out the authorization request first, using the OAuth2RequestFactory. All further logic should
         // query off of the authorization request instead of referring back to the parameters map. The contents of the
@@ -132,8 +150,8 @@ public class UaaAuthorizationEndpoint extends AbstractEndpoint {
         AuthorizationRequest authorizationRequest;
         try {
             authorizationRequest = getOAuth2RequestFactory().createAuthorizationRequest(parameters);
-        } catch (NoSuchClientException x) {
-            throw new InvalidClientException(x.getMessage());
+        } catch (DisallowedIdpException x) {
+            return switchIdp(model, client, clientId, request);
         }
 
         Set<String> responseTypes = authorizationRequest.getResponseTypes();
@@ -153,8 +171,6 @@ public class UaaAuthorizationEndpoint extends AbstractEndpoint {
                 throw new InsufficientAuthenticationException(
                     "User must be authenticated with Spring Security before authorization can be completed.");
             }
-
-            ClientDetails client = getClientDetailsService().loadClientByClientId(authorizationRequest.getClientId());
 
             // The resolved redirect URI is either the redirect_uri from the parameters or the one from
             // clientDetails. Either way we need to store it on the AuthorizationRequest.
@@ -216,6 +232,18 @@ public class UaaAuthorizationEndpoint extends AbstractEndpoint {
             throw e;
         }
 
+    }
+
+    private ModelAndView switchIdp(Map<String, Object> model, ClientDetails client, String clientId, HttpServletRequest request) {
+        Map<String, Object> additionalInfo = client.getAdditionalInformation();
+        String clientDisplayName = (String) additionalInfo.get(ClientConstants.CLIENT_NAME);
+        model.put("client_display_name", (clientDisplayName != null)? clientDisplayName : clientId);
+
+        String queryString = UaaHttpRequestUtils.paramsToQueryString(request.getParameterMap());
+        String redirectUri = request.getRequestURL() + "?" + queryString;
+        model.put("redirect", redirectUri);
+
+        return new ModelAndView("switch_idp");
     }
 
     @RequestMapping(value = "/oauth/authorize", method = RequestMethod.POST, params = OAuth2Utils.USER_OAUTH_APPROVAL)
